@@ -36,7 +36,7 @@
 		},
 		"go.testExplorer.packageDisplayMode": "nested",
 		"go.testExplorer.showOutput": true,
-		"go.testFlags": ["-ide", "-codesign", "-v"],
+		"go.testFlags": ["-ide", "-v"],
 		"editor.formatOnSave": true,
 		"editor.detectIndentation": false,
 		"files.associations": {

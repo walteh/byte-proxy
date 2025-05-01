@@ -1,10 +1,9 @@
 package byteproxy
 
 import (
-	"context"
+	"log/slog"
 	"os"
 
-	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 	"github.com/walteh/byte-proxy/pkg/bproxy"
 )
@@ -42,14 +41,28 @@ This routes connections with first byte 0x01 to broker1:9094 and 0x02 to broker2
 }
 
 func (me *Command) run(cmd *cobra.Command, args []string) error {
-	// Setup logger
-	logLevel := zerolog.InfoLevel
+	// Get context from cobra command - never use context.Background()
+	ctx := cmd.Context()
+
+	// Setup logger - we need to set up the logger here to configure it based on debug flag
+	var logLevel slog.Level
 	if me.Debug {
-		logLevel = zerolog.DebugLevel
+		logLevel = slog.LevelDebug
+	} else {
+		logLevel = slog.LevelInfo
 	}
-	zerolog.SetGlobalLevel(logLevel)
-	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
-	ctx := logger.WithContext(context.Background())
+
+	// Create a level variable we can adjust
+	levelVar := new(slog.LevelVar)
+	levelVar.Set(logLevel)
+
+	logHandler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: levelVar,
+	})
+	logger := slog.New(logHandler)
+
+	// Set the logger as the default logger for the entire program
+	slog.SetDefault(logger)
 
 	// Create the proxy
 	proxy := bproxy.New(me.ListenPort, me.Debug)
@@ -57,6 +70,7 @@ func (me *Command) run(cmd *cobra.Command, args []string) error {
 	// Parse mappings
 	err := proxy.ParseHexRoutes(me.Mappings)
 	if err != nil {
+		slog.ErrorContext(ctx, "Failed to parse route mappings", "error", err)
 		return err
 	}
 
@@ -64,5 +78,6 @@ func (me *Command) run(cmd *cobra.Command, args []string) error {
 	proxy.SetupCleanupOnSignals()
 
 	// Start the proxy
+	slog.InfoContext(ctx, "Starting byte-proxy", "port", me.ListenPort, "routes", len(me.Mappings))
 	return proxy.Start(ctx)
 }

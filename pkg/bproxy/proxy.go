@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -11,8 +12,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/rs/zerolog"
 )
 
 // Route represents a routing rule based on the first byte of a connection
@@ -37,12 +36,10 @@ type MapProxy struct {
 
 // New creates a new MapProxy instance
 func New(listenPort int, debug bool) *MapProxy {
-	ctx, cancel := context.WithCancel(context.Background())
+	// We don't create a context here anymore, it will come from the caller
 	return &MapProxy{
 		ListenPort: listenPort,
 		Debug:      debug,
-		ctx:        ctx,
-		cancel:     cancel,
 	}
 }
 
@@ -94,18 +91,18 @@ func (p *MapProxy) ParseHexRoutes(mappings []string) error {
 
 // Start begins listening and routing connections
 func (p *MapProxy) Start(ctx context.Context) error {
-	logger := zerolog.Ctx(ctx)
-	if logger == nil {
-		logger = &zerolog.Logger{}
-	}
+
+	// Store context for later use and setup cancel function
+	var cancel context.CancelFunc
+	p.ctx, cancel = context.WithCancel(ctx)
+	p.cancel = cancel
 
 	// Print routing table
-	logger.Info().Msg("Byte proxy routing table:")
+	slog.InfoContext(ctx, "Byte proxy routing table:")
 	for _, route := range p.Routes {
-		logger.Info().
-			Int("byte", int(route.Byte)).
-			Str("destination", route.Destination).
-			Msg("Route configured")
+		slog.InfoContext(ctx, "Route configured",
+			"byte", int(route.Byte),
+			"destination", route.Destination)
 	}
 
 	// Create listener
@@ -115,7 +112,7 @@ func (p *MapProxy) Start(ctx context.Context) error {
 	}
 	p.listener = listener
 
-	logger.Info().Int("port", p.ListenPort).Msg("Byte proxy listening")
+	slog.InfoContext(ctx, "Byte proxy listening", "port", p.ListenPort)
 
 	// Accept connections in a goroutine
 	acceptError := make(chan error, 1)
@@ -142,7 +139,7 @@ func (p *MapProxy) Start(ctx context.Context) error {
 				// Handle the connection
 				err := p.handleConnection(ctx, clientConn)
 				if err != nil {
-					logger.Error().Err(err).Msg("Connection handling error")
+					slog.ErrorContext(ctx, "Connection handling error", "error", err)
 				}
 			}(conn)
 		}
@@ -151,24 +148,25 @@ func (p *MapProxy) Start(ctx context.Context) error {
 	// Wait for context cancel or accept error
 	select {
 	case err := <-acceptError:
-		logger.Error().Err(err).Msg("Error accepting connections")
-		p.Shutdown()
+		slog.ErrorContext(ctx, "Error accepting connections", "error", err)
+		p.Shutdown(ctx)
 		return err
 	case <-ctx.Done():
-		p.Shutdown()
+		p.Shutdown(ctx)
 		return nil
 	}
 }
 
 // handleConnection processes an incoming connection
 func (p *MapProxy) handleConnection(ctx context.Context, clientConn net.Conn) error {
-	logger := zerolog.Ctx(ctx)
+	// Get remote address for logging
+	remoteAddr := clientConn.RemoteAddr().String()
 
 	// Read the first byte to determine the target
 	firstByte := make([]byte, 1)
 	_, err := clientConn.Read(firstByte)
 	if err != nil {
-		return fmt.Errorf("failed to read routing byte: %w", err)
+		return fmt.Errorf("failed to read routing byte from %s: %w", remoteAddr, err)
 	}
 
 	// Find the matching route
@@ -181,18 +179,21 @@ func (p *MapProxy) handleConnection(ctx context.Context, clientConn net.Conn) er
 	}
 
 	if targetRoute == nil {
-		return fmt.Errorf("no route found for byte: %d", firstByte[0])
+		return fmt.Errorf("no route found for byte %d from %s", firstByte[0], remoteAddr)
 	}
 
-	logger.Debug().
-		Int("byte", int(firstByte[0])).
-		Str("destination", targetRoute.Destination).
-		Msg("Routing connection")
+	if p.Debug {
+		slog.DebugContext(ctx, "Routing connection",
+			"byte", int(firstByte[0]),
+			"destination", targetRoute.Destination,
+			"client", remoteAddr)
+	}
 
 	// Connect to the target
 	targetConn, err := net.Dial("tcp", targetRoute.Destination)
 	if err != nil {
-		return fmt.Errorf("failed to connect to %s: %w", targetRoute.Destination, err)
+		return fmt.Errorf("failed to connect to %s for client %s: %w",
+			targetRoute.Destination, remoteAddr, err)
 	}
 	defer targetConn.Close()
 
@@ -201,13 +202,25 @@ func (p *MapProxy) handleConnection(ctx context.Context, clientConn net.Conn) er
 
 	// Client -> Target (don't forward the first byte, it was already consumed)
 	go func() {
-		_, err := io.Copy(targetConn, clientConn)
+		written, err := io.Copy(targetConn, clientConn)
+		if p.Debug && err == nil {
+			slog.DebugContext(ctx, "Connection closed",
+				"direction", "client->target",
+				"bytes", written,
+				"client", remoteAddr)
+		}
 		errCh <- err
 	}()
 
 	// Target -> Client
 	go func() {
-		_, err := io.Copy(clientConn, targetConn)
+		written, err := io.Copy(clientConn, targetConn)
+		if p.Debug && err == nil {
+			slog.DebugContext(ctx, "Connection closed",
+				"direction", "target->client",
+				"bytes", written,
+				"client", remoteAddr)
+		}
 		errCh <- err
 	}()
 
@@ -223,7 +236,10 @@ func (p *MapProxy) handleConnection(ctx context.Context, clientConn net.Conn) er
 }
 
 // Shutdown stops the proxy gracefully
-func (p *MapProxy) Shutdown() {
+func (p *MapProxy) Shutdown(ctx context.Context) {
+	// Get logger from context
+	slog.InfoContext(ctx, "Shutting down proxy")
+
 	if p.listener != nil {
 		p.listener.Close()
 	}
@@ -237,9 +253,14 @@ func (p *MapProxy) Shutdown() {
 
 	select {
 	case <-waitCh:
-		// All connections closed gracefully
+		slog.InfoContext(ctx, "All connections closed gracefully")
 	case <-time.After(5 * time.Second):
-		// Timeout waiting for connections to close
+		slog.InfoContext(ctx, "Timeout waiting for connections to close")
+	}
+
+	// Call cancel function to release resources
+	if p.cancel != nil {
+		p.cancel()
 	}
 }
 
@@ -254,7 +275,9 @@ func (p *MapProxy) SetupCleanupOnSignals() {
 	// Start a goroutine to handle signals
 	go func() {
 		<-sigChan
-		p.Shutdown()
+		// We can't get a logger here since we don't have a context
+		// Just shut down silently when receiving a signal
+		p.Shutdown(context.TODO()) // Use context.TODO() as a fallback
 		os.Exit(0)
 	}()
 }
