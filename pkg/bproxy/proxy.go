@@ -14,6 +14,14 @@ import (
 	"time"
 )
 
+// Proxy interface defines the methods that any proxy implementation must support
+type Proxy interface {
+	ParseHexRoutes(mappings []string) error
+	Start(ctx context.Context) error
+	Shutdown(ctx context.Context)
+	SetupCleanupOnSignals()
+}
+
 // Route represents a routing rule based on the first byte of a connection
 type Route struct {
 	Byte        byte
@@ -35,7 +43,7 @@ type MapProxy struct {
 }
 
 // New creates a new MapProxy instance
-func New(listenPort int, debug bool) *MapProxy {
+func New(listenPort int, debug bool) Proxy {
 	// We don't create a context here anymore, it will come from the caller
 	return &MapProxy{
 		ListenPort: listenPort,
@@ -91,7 +99,6 @@ func (p *MapProxy) ParseHexRoutes(mappings []string) error {
 
 // Start begins listening and routing connections
 func (p *MapProxy) Start(ctx context.Context) error {
-
 	// Store context for later use and setup cancel function
 	var cancel context.CancelFunc
 	p.ctx, cancel = context.WithCancel(ctx)
@@ -136,8 +143,11 @@ func (p *MapProxy) Start(ctx context.Context) error {
 				defer p.wg.Done()
 				defer clientConn.Close()
 
-				// Handle the connection
-				err := p.handleConnection(ctx, clientConn)
+				// Handle the connection - pass the current context
+				connCtx, cancel := context.WithCancel(ctx)
+				defer cancel()
+
+				err := p.handleConnection(connCtx, clientConn)
 				if err != nil {
 					slog.ErrorContext(ctx, "Connection handling error", "error", err)
 				}
@@ -153,7 +163,7 @@ func (p *MapProxy) Start(ctx context.Context) error {
 		return err
 	case <-ctx.Done():
 		p.Shutdown(ctx)
-		return nil
+		return ctx.Err()
 	}
 }
 
@@ -189,16 +199,33 @@ func (p *MapProxy) handleConnection(ctx context.Context, clientConn net.Conn) er
 			"client", remoteAddr)
 	}
 
-	// Connect to the target
-	targetConn, err := net.Dial("tcp", targetRoute.Destination)
+	// Create a connection-specific timeout context
+	dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer dialCancel()
+
+	// Connect to the target using timeout context
+	var dialer net.Dialer
+	targetConn, err := dialer.DialContext(dialCtx, "tcp", targetRoute.Destination)
 	if err != nil {
 		return fmt.Errorf("failed to connect to %s for client %s: %w",
 			targetRoute.Destination, remoteAddr, err)
 	}
 	defer targetConn.Close()
 
-	// Copy data in both directions
+	// Copy data in both directions with context cancellation
 	errCh := make(chan error, 2)
+
+	// Set up context cancellation for copy operations
+	copyCtx, copyCancel := context.WithCancel(ctx)
+	defer copyCancel()
+
+	// Monitor context for cancellation
+	go func() {
+		<-copyCtx.Done()
+		// Force connections to close on context cancellation
+		clientConn.Close()
+		targetConn.Close()
+	}()
 
 	// Client -> Target (don't forward the first byte, it was already consumed)
 	go func() {
@@ -224,11 +251,16 @@ func (p *MapProxy) handleConnection(ctx context.Context, clientConn net.Conn) er
 		errCh <- err
 	}()
 
-	// Wait for either direction to finish or error
+	// Wait for either direction to finish or error or context cancellation
 	var copyErr error
 	for i := 0; i < 2; i++ {
-		if err := <-errCh; err != nil && err != io.EOF {
-			copyErr = err
+		select {
+		case err := <-errCh:
+			if err != nil && err != io.EOF {
+				copyErr = err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 
@@ -237,12 +269,16 @@ func (p *MapProxy) handleConnection(ctx context.Context, clientConn net.Conn) er
 
 // Shutdown stops the proxy gracefully
 func (p *MapProxy) Shutdown(ctx context.Context) {
-	// Get logger from context
 	slog.InfoContext(ctx, "Shutting down proxy")
 
+	// Close the listener to stop accepting new connections
 	if p.listener != nil {
 		p.listener.Close()
 	}
+
+	// Create a timeout context for waiting for connections to close
+	shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
 	// Wait for active connections to finish with timeout
 	waitCh := make(chan struct{})
@@ -254,7 +290,7 @@ func (p *MapProxy) Shutdown(ctx context.Context) {
 	select {
 	case <-waitCh:
 		slog.InfoContext(ctx, "All connections closed gracefully")
-	case <-time.After(5 * time.Second):
+	case <-shutdownCtx.Done():
 		slog.InfoContext(ctx, "Timeout waiting for connections to close")
 	}
 
@@ -275,9 +311,10 @@ func (p *MapProxy) SetupCleanupOnSignals() {
 	// Start a goroutine to handle signals
 	go func() {
 		<-sigChan
-		// We can't get a logger here since we don't have a context
-		// Just shut down silently when receiving a signal
-		p.Shutdown(context.TODO()) // Use context.TODO() as a fallback
+		// We need a context for shutdown
+		ctx := context.Background()
+		slog.InfoContext(ctx, "Received signal, shutting down")
+		p.Shutdown(ctx)
 		os.Exit(0)
 	}()
 }
