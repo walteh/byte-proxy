@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/walteh/byte-proxy/pkg/dialer"
 )
 
 // setupEchoServer creates a simple TCP echo server for testing
@@ -76,6 +77,9 @@ func TestIntegration(t *testing.T) {
 	serverAddr, cleanup := setupEchoServer(t)
 	defer cleanup()
 
+	// Define the "target" we want to route to through the proxy
+	targetAddress := "echo.service:80"
+
 	// Find an available port for the proxy
 	proxyListener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -89,9 +93,10 @@ func TestIntegration(t *testing.T) {
 	defer os.Remove("byte-proxy-test") // Clean up the binary
 
 	// Prepare command to run the proxy with the echo server as target
+	// This maps our virtual "echo.service:80" to the actual echo server address
 	cmd := exec.Command("./byte-proxy-test",
 		"--listen-port", proxyPort,
-		"--map", "0x01="+serverAddr,
+		"--map", "0x00="+serverAddr, // Maps byte 0 to our echo server
 		"--debug")
 
 	// Capture command output
@@ -119,39 +124,76 @@ func TestIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Connect to the proxy
+	// Build proxy address
 	proxyAddr := "127.0.0.1:" + proxyPort
-	d := net.Dialer{}
-	conn, err := d.DialContext(ctx, "tcp", proxyAddr)
-	require.NoError(t, err, "Failed to connect to proxy: %s", proxyAddr)
-	defer conn.Close()
 
-	// Send the routing byte (0x01) followed by test data
-	testData := []byte("Hello, Proxy!")
-	_, err = conn.Write([]byte{0x01})
-	require.NoError(t, err, "Failed to send routing byte")
+	// Test Part 1: Traditional direct connection (for reference)
+	t.Run("DirectConnection", func(t *testing.T) {
+		// Connect directly to the proxy (without the dialer package)
+		directConn, err := net.Dial("tcp", proxyAddr)
+		require.NoError(t, err, "Failed to connect to proxy directly")
+		defer directConn.Close()
 
-	// Wait a bit to ensure the routing byte is processed
-	time.Sleep(100 * time.Millisecond)
+		// Send the routing byte (0x00) followed by test data
+		testData := []byte("Hello via direct connection!")
+		_, err = directConn.Write([]byte{0x00})
+		require.NoError(t, err, "Failed to send routing byte")
 
-	_, err = conn.Write(testData)
-	require.NoError(t, err, "Failed to send test data")
+		// Wait a bit to ensure the routing byte is processed
+		time.Sleep(100 * time.Millisecond)
 
-	// Set a timeout for reading the response
-	err = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	require.NoError(t, err)
+		_, err = directConn.Write(testData)
+		require.NoError(t, err, "Failed to send test data")
 
-	// Read and verify the response
-	response := make([]byte, 1024)
-	n, err := conn.Read(response)
+		// Set a timeout for reading the response
+		err = directConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		require.NoError(t, err)
 
-	// Log proxy output regardless of test result
+		// Read and verify the response
+		response := make([]byte, 1024)
+		n, err := directConn.Read(response)
+		require.NoError(t, err, "Failed to read response from direct connection")
+
+		// Verify the echo server prefixed our data with "ECHO:"
+		expected := "ECHO:" + string(testData)
+		assert.Equal(t, expected, string(response[:n]), "Incorrect response data from direct connection")
+	})
+
+	// Test Part 2: Using the dialer package
+	t.Run("DialerPackage", func(t *testing.T) {
+		// Create our dialer with the target route mapping
+		proxyDialer := dialer.New(ctx, proxyAddr, []string{targetAddress})
+
+		// Connect via the dialer package which handles routing byte
+		conn, err := proxyDialer.Dial("tcp", targetAddress)
+		require.NoError(t, err, "Failed to connect using the dialer package")
+		defer conn.Close()
+
+		// Send test data - the dialer has already sent the routing byte
+		testData := []byte("Hello via dialer package!")
+		_, err = conn.Write(testData)
+		require.NoError(t, err, "Failed to send test data through dialer")
+
+		// Set a timeout for reading the response
+		err = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		require.NoError(t, err)
+
+		// Read and verify the response
+		response := make([]byte, 1024)
+		n, err := conn.Read(response)
+		require.NoError(t, err, "Failed to read response through dialer")
+
+		// Verify the echo server prefixed our data with "ECHO:"
+		expected := "ECHO:" + string(testData)
+		assert.Equal(t, expected, string(response[:n]), "Incorrect response data through dialer")
+
+		// Check RemoteAddr to verify the connection wrapper works properly
+		addr := conn.RemoteAddr().String()
+		assert.Contains(t, addr, targetAddress, "RemoteAddr doesn't contain the target address")
+		assert.Contains(t, addr, "proxy", "RemoteAddr doesn't indicate proxy connection")
+	})
+
+	// Log proxy output
 	t.Logf("Proxy stdout: %s", stdout.String())
 	t.Logf("Proxy stderr: %s", stderr.String())
-
-	require.NoError(t, err, "Failed to read response")
-
-	// Verify the echo server prefixed our data with "ECHO:"
-	expected := "ECHO:" + string(testData)
-	assert.Equal(t, expected, string(response[:n]), "Incorrect response data")
 }

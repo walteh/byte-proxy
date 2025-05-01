@@ -33,7 +33,7 @@ type Route struct {
 // MapProxy represents a proxy that routes connections based on the first byte
 type MapProxy struct {
 	ListenPort int
-	Routes     []Route
+	Routes     map[byte]Route
 	Debug      bool
 
 	listener net.Listener
@@ -54,7 +54,7 @@ func New(listenPort int, debug bool) Proxy {
 // ParseHexRoutes parses byte routing rules from string mappings
 // Each mapping must be in the format "0xXX=host:port"
 func (p *MapProxy) ParseHexRoutes(mappings []string) error {
-	var routes []Route
+	routes := make(map[byte]Route)
 
 	for _, mapping := range mappings {
 		parts := strings.Split(mapping, "=")
@@ -81,12 +81,12 @@ func (p *MapProxy) ParseHexRoutes(mappings []string) error {
 			return fmt.Errorf("destination should be in host:port format: %s", dest)
 		}
 
-		routes = append(routes, Route{
+		routes[b] = Route{
 			Byte:        b,
 			Destination: dest,
 			Host:        hostPort[0],
 			Port:        hostPort[1],
-		})
+		}
 	}
 
 	if len(routes) == 0 {
@@ -180,15 +180,8 @@ func (p *MapProxy) handleConnection(ctx context.Context, clientConn net.Conn) er
 	}
 
 	// Find the matching route
-	var targetRoute *Route
-	for i, route := range p.Routes {
-		if route.Byte == firstByte[0] {
-			targetRoute = &p.Routes[i]
-			break
-		}
-	}
-
-	if targetRoute == nil {
+	targetRoute, ok := p.Routes[firstByte[0]]
+	if !ok {
 		return fmt.Errorf("no route found for byte %d from %s", firstByte[0], remoteAddr)
 	}
 
